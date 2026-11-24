@@ -1,0 +1,116 @@
+# Local Brand Brain RAG: Qdrant + Infinity (bge-m3) + Ollama (Qwen) + API.
+#
+#   cp .env.example .env
+#   docker compose up -d --build
+#   open http://localhost:8000/docs
+#
+# First start downloads the embedding model (~2.3 GB) and the LLM
+# (~4.7 GB for qwen2.5:7b q4_K_M). They are cached in named volumes.
+#
+# Only the API (and optionally the Qdrant dashboard) is published, and only on
+# 127.0.0.1. Inference services are reachable from the compose network only.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"  # dashboard at /dashboard; remove if not needed
+
+  infinity:
+    # Pinned to the digest used in production.
+    image: michaelf34/infinity:latest@sha256:11e8b3921b9f1a58965afaad4a844c435c9807cbc82c51e47cb147b7d977fc88
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    command: ["v2", "--model-id", "${EMBEDDING_MODEL:-BAAI/bge-m3}", "--host", "0.0.0.0", "--port", "7997"]
+    environment:
+      HF_HOME: /app/.cache
+      INFINITY_ANONYMOUS_USAGE_STATS: "0"
+    volumes:
+      - infinity_cache:/app/.cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7997/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10m  # first start downloads bge-m3
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+
+  ollama:
+    image: ollama/ollama:latest@sha256:509fdf54e23bd50d87af646cb51c0a7a203d6a83cc4d6695b3b08c5be1c62c0a
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+    # NVIDIA GPU: uncomment (needs nvidia-container-toolkit).
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # One-shot: pull the configured model into the ollama volume, then exit.
+  ollama-pull:
+    image: ollama/ollama:latest@sha256:509fdf54e23bd50d87af646cb51c0a7a203d6a83cc4d6695b3b08c5be1c62c0a
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${LLM_MODEL:-qwen2.5:7b-instruct-q4_K_M}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    restart: unless-stopped
+    logging: *default-logging
+    env_file:
+      - path: .env
+        required: false  # defaults in app/config.py work without it
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      INFINITY_URL: http://infinity:7997
+      # Same variables as ollama-pull / infinity, so the pulled model and the
+      # model the API asks for can never differ.
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct-q4_K_M}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      qdrant:
+        condition: service_started
+      infinity:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+
+volumes:
+  qdrant_data:
+  infinity_cache:
+  ollama_data:
